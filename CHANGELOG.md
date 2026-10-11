@@ -3,6 +3,15 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.1] - 2026-10-11
+
+qwen36: PILOT prefetch now runs multiple concurrent I/O worker threads
+(`COLI_PILOT_WORKERS`, default 4, 1-16) instead of one, with a CAS-based
+lock-free queue so workers never double-process or skip a cold-expert fetch.
+Measured ~1.5-1.7 tok/s on Qwen3-Coder-30B-A3B vs. 0.84 tok/s with a single
+worker, on hardware where disk I/O latency (not compute) was the bottleneck.
+Pure I/O-parallelism change — no effect on quantization, routing, or sampling.
+
 ## [2.0.0] - 2026-10-06
 
 169 pull requests since v1.12.1, 88 of them from contributors. Every MoE

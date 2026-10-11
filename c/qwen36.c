@@ -1062,12 +1062,19 @@ static int slot_victim(const LCache *lc, int layer, int allow_pinned) {
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
         pilot_m = m;
-        pthread_t t;
-        if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
-            fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
-            exit(1);
+        /* COLI_PILOT_WORKERS: meerdere prefetch-I/O-threads i.p.v. één (default 4),
+         * zodat cold-expert-disk-reads gelijktijdig in plaats van serieel gebeuren. */
+        const char *e = getenv("COLI_PILOT_WORKERS");
+        int n = e ? atoi(e) : 4;
+        if (n < 1) n = 1; if (n > 16) n = 16;
+        for (int i = 0; i < n; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
+                fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
+                exit(1);
+            }
+            pthread_detach(t);
         }
-        pthread_detach(t);
     }
 }
 
@@ -4466,15 +4473,30 @@ static void pilot_realload(Model *m, int layer, int eid) {
     m->is_queued[layer*c->n_experts+eid] = 0; pthread_mutex_unlock(&g_pilot_mx);
 }
 
+/* GEMETEN (2026-10-11, websearch io_uring/async-I/O-onderzoek): één worker-thread
+ * verwerkt de hele prefetch-wachtrij serieel, elk cold-expert-fetch (~0,4ms disk-I/O)
+ * na elkaar -- precies het patroon dat async/batched I/O (io_uring op Linux) juist
+ * omzeilt door veel verzoeken tegelijk in de lucht te hebben. macOS heeft geen
+ * io_uring, maar hetzelfde idee (meer gelijktijdige I/O) werkt ook met gewone
+ * pthreads. De oude lus was single-consumer (pilot_r onvoorwaardelijk verhoogd);
+ * met meerdere workers moet het claimen van een wachtrij-slot atomair (CAS) zodat
+ * nooit twee threads hetzelfde item verwerken of een item wordt overgeslagen --
+ * een standaard, correct lock-free SPMC-patroon (de producer schrijft l/e pas
+ * voor de release-store van pilot_w, dus de data is altijd al zichtbaar voor een
+ * winnende CAS). Puur I/O-parallellisatie, raakt geen quantisatie/routering. */
 static void *pilot_worker(void *arg) {
     (void)arg;
     while (1) {
-        unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
-        unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_ACQUIRE);
-        if (r == w) { sleep_ms(1); continue; }
+        unsigned r, w; int got = 0;
+        for (;;) {
+            r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+            w = __atomic_load_n(&pilot_w, __ATOMIC_ACQUIRE);
+            if (r == w) break;
+            if (__atomic_compare_exchange_n(&pilot_r, &r, r + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { got = 1; break; }
+        }
+        if (!got) { sleep_ms(1); continue; }
         int layer = pilot_q[r & 4095].l, eid = pilot_q[r & 4095].e;
         pilot_realload(pilot_m, layer, eid);
-        __atomic_store_n(&pilot_r, r + 1, __ATOMIC_RELEASE);
     }
     return NULL;
 }
